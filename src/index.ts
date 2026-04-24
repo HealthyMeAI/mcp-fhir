@@ -24,22 +24,107 @@ import axios from 'axios';
 
 interface FHIRConfig {
   baseUrl: string;
-  accessToken: string;
+  username?: string;
+  password?: string;
+  apiKey?: string;
+  firmUrlPrefix?: string;
+  accessToken?: string;
+  useOAuth2?: boolean;
+  oauthEndpoint?: string;
 }
 
 const config: FHIRConfig = {
   baseUrl: process.env.FHIR_BASE_URL || '',
-  accessToken: process.env.FHIR_ACCESS_TOKEN || '',
+  username: process.env.FHIR_USERNAME,
+  password: process.env.FHIR_PASSWORD,
+  apiKey: process.env.FHIR_API_KEY,
+  firmUrlPrefix: process.env.FHIR_FIRM_URL_PREFIX,
+  accessToken: process.env.FHIR_ACCESS_TOKEN,
+  useOAuth2: process.env.FHIR_USE_OAUTH2 === 'true',
+  oauthEndpoint: process.env.FHIR_OAUTH_ENDPOINT,
 };
 
-// FHIR client setup
+let cachedAccessToken: string | null = null;
+let refreshTokenValue: string | null = null;
+let tokenExpirationTime: number | null = null;
+const FIVE_MINUTES_IN_MS = 5 * 60 * 1000;
+
+async function fetchOAuth2Token(useRefreshToken = false): Promise<string> {
+  if (!config.username || !config.password || !config.apiKey) {
+    throw new Error('FHIR_USERNAME, FHIR_PASSWORD, and FHIR_API_KEY environment variables must be set for OAuth2 authentication');
+  }
+
+  const oauthEndpoint = config.oauthEndpoint || constructOAuthEndpointFromBaseUrl();
+
+  const requestBody = new URLSearchParams();
+
+  if (useRefreshToken && refreshTokenValue) {
+    requestBody.append('grant_type', 'refresh_token');
+    requestBody.append('refresh_token', refreshTokenValue);
+  } else {
+    requestBody.append('grant_type', 'password');
+    requestBody.append('username', config.username);
+    requestBody.append('password', config.password);
+  }
+
+  const response = await axios.post(oauthEndpoint, requestBody, {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'x-api-key': config.apiKey,
+    },
+  });
+
+  cachedAccessToken = response.data.access_token;
+  refreshTokenValue = response.data.refresh_token;
+  tokenExpirationTime = Date.now() + (response.data.expires_in * 1000);
+
+  return cachedAccessToken!;
+}
+
+function constructOAuthEndpointFromBaseUrl(): string {
+  const baseUrl = new URL(config.baseUrl);
+  const pathParts = baseUrl.pathname.split('/').filter(part => part.length > 0);
+
+  const environmentPath = pathParts[0] || 'ema-training';
+  const firmPrefix = config.firmUrlPrefix || 'apiportal';
+
+  return `${baseUrl.protocol}//${baseUrl.hostname}/${environmentPath}/firm/${firmPrefix}/ema/ws/oauth2/grant`;
+}
+
+async function getAccessToken(): Promise<string> {
+  if (!config.useOAuth2 && config.accessToken) {
+    return config.accessToken;
+  }
+
+  if (config.useOAuth2) {
+    const isTokenValid = cachedAccessToken &&
+                        tokenExpirationTime &&
+                        tokenExpirationTime > Date.now() + FIVE_MINUTES_IN_MS;
+
+    if (isTokenValid && cachedAccessToken) {
+      return cachedAccessToken;
+    }
+
+    const useRefresh = refreshTokenValue !== null;
+    return await fetchOAuth2Token(useRefresh);
+  }
+
+  throw new Error('Either FHIR_ACCESS_TOKEN (for static token) or OAuth2 parameters (FHIR_USERNAME, FHIR_PASSWORD, FHIR_API_KEY, FHIR_FIRM_URL_PREFIX, FHIR_USE_OAUTH2=true) must be set');
+}
+
 const fhirClient = axios.create({
   baseURL: config.baseUrl,
   headers: {
-    'Authorization': `Bearer ${config.accessToken}`,
     'Content-Type': 'application/fhir+json',
     'Accept': 'application/fhir+json',
+    ...(config.apiKey && { 'x-api-key': config.apiKey }),
   },
+});
+
+fhirClient.interceptors.request.use(async (axiosConfig) => {
+  const token = await getAccessToken();
+  axiosConfig.headers.Authorization = `Bearer ${token}`;
+  return axiosConfig;
 });
 
 // Add type for capability statement
@@ -207,15 +292,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 });
 
 async function main() {
-  if (!config.baseUrl || !config.accessToken) {
-    throw new Error('FHIR_BASE_URL and FHIR_ACCESS_TOKEN environment variables must be set');
+  if (!config.baseUrl) {
+    throw new Error('FHIR_BASE_URL environment variable must be set');
   }
-  
-  // Validate FHIR server connection by fetching capability statement
-  await getCapabilityStatement();
+
+  if (!config.useOAuth2 && !config.accessToken) {
+    throw new Error('FHIR_ACCESS_TOKEN environment variable must be set when not using OAuth2');
+  }
+
+  if (config.useOAuth2) {
+    if (!config.username || !config.password || !config.apiKey || !config.firmUrlPrefix) {
+      throw new Error('FHIR_USERNAME, FHIR_PASSWORD, FHIR_API_KEY, and FHIR_FIRM_URL_PREFIX environment variables must be set for OAuth2 authentication');
+    }
+  }
   
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  
+  try {
+    await getCapabilityStatement();
+  } catch (error) {
+    console.error('Warning: Failed to fetch capability statement during startup:', error);
+    console.error('The MCP server will continue, but FHIR operations may fail if the server is unreachable.');
+  }
 }
 
 main().catch((error) => {
