@@ -1,8 +1,5 @@
 # @flexpa/mcp-fhir
 
-> [!WARNING]
-> This is an experimental demo not intended for production use.
-
 This is a TypeScript-based MCP server that connects to a FHIR server. It provides core MCP functionality for interacting with FHIR resources by:
 
 - Accessing FHIR resources via URIs
