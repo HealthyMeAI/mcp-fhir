@@ -1,4 +1,3 @@
-
 # @flexpa/mcp-fhir
 
 > [!WARNING]
@@ -100,11 +99,11 @@ For OAuth2 authentication (ModMed):
     },
     "env": {
       "FHIR_BASE_URL": "https://stage.ema-api.com/ema-dev/firm/apiportal/ema/fhir/v2/Patient",
-      "FHIR_USERNAME": "xxx",
-      "FHIR_PASSWORD": "xxx",
-      "FHIR_API_KEY": "xxx",
-      "FHIR_FIRM_URL_PREFIX": "xxx",
-      "FHIR_USE_OAUTH2": "true"
+      "FHIR_USERNAME": "<FHIR_USERNAME>",
+      "FHIR_PASSWORD": "<FHIR_PASSWORD>",
+      "FHIR_API_KEY": "<FHIR_API_KEY>",
+      "FHIR_FIRM_URL_PREFIX": "<FHIR_FIRM_URL_PREFIX>",
+      "FHIR_USE_OAUTH2": "<FHIR_USE_OAUTH2>"
     }
   }
 }
@@ -121,4 +120,5 @@ npm run inspector
 ```
 
 The Inspector will provide a URL to access debugging tools in your browser.
+
 
