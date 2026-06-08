@@ -23,6 +23,105 @@ This is a TypeScript-based MCP server that connects to a FHIR server. It provide
 - `read_fhir` - Read an individual FHIR resource
   - Takes `uri` as a parameter
   - Returns the FHIR resource in JSON format
+- `create_fhir` - Create a new FHIR resource
+  - Takes `resourceType`, `payload` (FHIR resource JSON), and optional `operation` (e.g. `$validate`)
+  - Returns the created resource or a status with location header
+- `update_fhir` - Update an existing FHIR resource
+  - Takes `resourceType`, `id`, `payload`, and optional `operation`
+  - Sends a PUT with the full resource body
+- `delete_fhir` - Delete a FHIR resource
+  - Takes `resourceType`, `id`, and optional `operation`
+  - Sends a DELETE request
+
+## ModMed EMA FHIR API Notes
+
+This server was built and tested against the ModMed EMA staging API. Below are important findings to avoid common pitfalls.
+
+### Resource Operation Support
+
+Not all FHIR resources support all CRUD operations on ModMed:
+
+| Resource | READ | SEARCH | CREATE | UPDATE | Notes |
+|---|---|---|---|---|---|
+| AllergyIntolerance | ✅ | ✅ | ✅ | ✅ | |
+| Appointment | ✅ | ✅ | ✅ | ✅ | Dedicated appointment endpoints |
+| ChargeItem | ✅ | ✅ | ✅ | ❌ | Create charges into ModMedPM |
+| Composition | ✅ | ✅ | ✅ | ❌ | Requires encounter reference |
+| Condition | ✅ | ✅ | ✅ | ✅ | Must be reconciled by practice in UI |
+| Coverage | ✅ | ✅ | ✅ | ✅ | |
+| DiagnosticReport | ✅ | ✅ | ❌ | ❌ | Results only |
+| DocumentReference | ✅ | ✅ | ✅ | ❌ | Upload from S3 URL |
+| **Encounter** | ✅ | ✅ | ❌ | ❌ | **Read-only. Created internally from appointments** |
+| MedicationStatement | ✅ | ✅ | ✅ | ✅ | |
+| Organization | ✅ | ✅ | ✅ | ❌ | Referring institutions |
+| Patient | ✅ | ✅ | ✅ | ✅ | |
+| Practitioner | ✅ | ✅ | ✅ | ❌ | Referring practitioners only |
+| ServiceRequest | ✅ | ✅ | ❌ | ❌ | Orders only |
+
+### Condition CREATE Requirements
+
+Conditions require specific ModMed field formats that differ from standard FHIR:
+
+```json
+{
+  "resourceType": "Condition",
+  "clinicalStatus": {
+    "coding": [{
+      "system": "http://hl7.org/fhir/ValueSet/condition-clinical",
+      "code": "ACTIVE"
+    }],
+    "text": "Active"
+  },
+  "category": [{
+    "coding": [{
+      "system": "<FHIR_BASE_URL>/../ValueSet/condition-category",
+      "code": "DIAGNOSIS"
+    }],
+    "text": "Diagnosis"
+  }],
+  "code": {
+    "coding": [{
+      "system": "ICD10",
+      "code": "L70.0",
+      "display": "Acne vulgaris"
+    }],
+    "text": "Acne vulgaris"
+  },
+  "subject": {
+    "reference": "<FHIR_BASE_URL>/Patient/<id>"
+  },
+  "encounter": {
+    "reference": "<FHIR_BASE_URL>/Encounter/<id>"
+  }
+}
+```
+
+**Key points:**
+- `code.coding[].system` must be `"ICD10"`, `"ICD9"`, or `"SNOMED CT"` — **not** URN-style like `http://hl7.org/fhir/sid/icd-10-cm`
+- `clinicalStatus.coding[].code` must be **uppercase**: `"ACTIVE"`, `"INACTIVE"`, `"RESOLVED"`
+- `category` must use the ModMed ValueSet URL and one of: `DIAGNOSIS`, `PROBLEM`, `CONDITION`, `SYMPTOM`, `FINDING`, `COMPLAINT`, `FUNCTIONAL LIMITATION`, `HEALTH STATUS`
+- Conditions created via API must be **reconciled by the practice** in the ModMed UI before appearing on the patient's chart
+
+### Encounter Limitations
+
+Encounters **cannot be created via the FHIR API**. They are created internally by the ModMed workflow when:
+- A patient checks in for an appointment
+- An appointment is converted to an encounter in the ModMed UI
+
+Attempting to POST an Encounter will fail with errors about missing "Encounter Location", "Primary Biller", and "Universal Id" — these are internal ModMed fields not exposed via FHIR.
+
+### API Response Behavior
+
+- Successful CREATE requests may return an **empty response body** with the new resource URL in the `Location` header
+- Errors are returned as FHIR `OperationOutcome` resources
+- Search results are returned as FHIR `Bundle` resources with pagination links
+
+### ModMed API Documentation
+
+- API reference: https://portal.api.modmed.com/
+- LLM-friendly index: https://portal.api.modmed.com/llms.txt
+- Encounter docs: https://portal.api.modmed.com/reference/encountersvisits.md
+- Condition docs: https://portal.api.modmed.com/reference/condition-1.md
 
 ## Configuration
 

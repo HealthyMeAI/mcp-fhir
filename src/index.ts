@@ -5,6 +5,9 @@
  * It supports:
  * - Reading FHIR resources
  * - Searching FHIR resources
+ * - Creating FHIR resources
+ * - Updating FHIR resources
+ * - Deleting FHIR resources
  * - Retrieving CapabilityStatement
  */
 
@@ -238,6 +241,101 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["uri"]
         }
+      },
+      {
+        name: "create_fhir",
+        description: [
+          "Create a new FHIR resource. Sends a POST to the FHIR server with the provided resource payload.",
+          "",
+          "IMPORTANT - ModMed EMA resource support & requirements:",
+          "- Resources that support CREATE: AllergyIntolerance, ChargeItem, Composition, Condition, Coverage, DocumentReference, MedicationStatement, Organization, Patient, Practitioner (referring)",
+          "- Resources that are READ-ONLY (no CREATE): Encounter (created internally from appointments), Appointment (use dedicated Appointment endpoints), DiagnosticReport, ServiceRequest, Procedure",
+          "- Encounters are created internally by ModMed workflow (from appointments) and cannot be POSTed.",
+          "",
+          "Condition CREATE requires these ModMed-specific formats:",
+          '- clinicalStatus: use "ACTIVE" (uppercase) in coding, e.g. {"coding":[{"system":"http://hl7.org/fhir/ValueSet/condition-clinical","code":"ACTIVE"}],"text":"Active"}',
+          '- category: use ModMed ValueSet URL, e.g. {"coding":[{"system":"<baseurl>/ValueSet/condition-category","code":"DIAGNOSIS"}],"text":"Diagnosis"}. Accepted codes: DIAGNOSIS, PROBLEM, CONDITION, SYMPTOM, FINDING, COMPLAINT, FUNCTIONAL LIMITATION, HEALTH STATUS',
+          '- code.coding[].system: use "ICD10", "ICD9", or "SNOMED CT" (not URN-style like http://hl7.org/fhir/sid/icd-10-cm)',
+          "- Conditions created via API must be reconciled by the practice in the ModMed UI before appearing on the patient chart.",
+          "",
+          "ChargeItem CREATE requires: account (patient reference), encounter, code with CPT/HCPCS coding, and quantity.",
+          "Composition CREATE requires: subject (patient), encounter, author (practitioner), section with narrative.",
+          "",
+          "On success, the API may return an empty body with the new resource location in headers."
+        ].join("\n"),
+        inputSchema: {
+          type: "object",
+          properties: {
+            resourceType: {
+              type: "string",
+              description: "Type of FHIR resource to create (e.g. Patient, ChargeItem, Composition, Condition)"
+            },
+            payload: {
+              type: "object",
+              description: "The full FHIR resource body to create, as a JSON object. Must include resourceType and all required fields."
+            },
+            operation: {
+              type: "string",
+              description: "Optional FHIR operation name (e.g. $validate). Appended to the URL when provided."
+            }
+          },
+          required: ["resourceType", "payload"]
+        }
+      },
+      {
+        name: "update_fhir",
+        description: [
+          "Update an existing FHIR resource by ID. Sends a PUT to the FHIR server with the provided resource payload.",
+          "",
+          "IMPORTANT - ModMed EMA resource support:",
+          "- Resources that support UPDATE: AllergyIntolerance, Condition, Coverage, MedicationStatement, Patient, Appointment",
+          "- Some fields are immutable on update (e.g., Condition subject/code/recordedDate cannot be changed).",
+          "- Condition UPDATE only supports: abatement, clinicalStatus, category."
+        ].join("\n"),
+        inputSchema: {
+          type: "object",
+          properties: {
+            resourceType: {
+              type: "string",
+              description: "Type of FHIR resource to update (e.g. Patient, Condition, Coverage)"
+            },
+            id: {
+              type: "string",
+              description: "The logical ID of the FHIR resource to update"
+            },
+            payload: {
+              type: "object",
+              description: "The complete FHIR resource body to update. The payload must include all mandatory fields defined by the resource's profile."
+            },
+            operation: {
+              type: "string",
+              description: "Optional FHIR operation name (e.g. $validate). Appended to the URL when provided."
+            }
+          },
+          required: ["resourceType", "id", "payload"]
+        }
+      },
+      {
+        name: "delete_fhir",
+        description: "Delete a FHIR resource by ID. Sends a DELETE to the FHIR server.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            resourceType: {
+              type: "string",
+              description: "Type of FHIR resource to delete (e.g. Patient, ChargeItem, Composition)"
+            },
+            id: {
+              type: "string",
+              description: "The logical ID of the FHIR resource to delete"
+            },
+            operation: {
+              type: "string",
+              description: "Optional FHIR operation name (e.g. $expunge). Appended to the URL when provided."
+            }
+          },
+          required: ["resourceType", "id"]
+        }
       }
     ]
   };
@@ -283,6 +381,173 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         };
       } catch (error: any) {
         throw new Error(`Failed to fetch FHIR resource: ${error.message}`);
+      }
+    }
+
+    case "create_fhir": {
+      const resourceType = String(request.params.arguments?.resourceType);
+      const payload = request.params.arguments?.payload as Record<string, any>;
+      const operation = request.params.arguments?.operation ? String(request.params.arguments.operation) : '';
+
+      if (!resourceType) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "required", diagnostics: "A required element 'resourceType' is missing." }]
+            }, null, 2)
+          }]
+        };
+      }
+
+      try {
+        const url = operation ? `/${resourceType}/${operation}` : `/${resourceType}`;
+        const response = await fhirClient.post(url, payload);
+        
+        // If the response body is empty, return the Location header info
+        if (!response.data || (typeof response.data === 'string' && response.data.trim() === '')) {
+          const location = response.headers?.location || response.headers?.Location || '';
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "created",
+                resourceType,
+                location,
+                message: location ? `Resource created at ${location}` : "Resource created successfully (no body returned)"
+              }, null, 2)
+            }]
+          };
+        }
+        
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(response.data, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        const errorData = error.response?.data || { message: error.message };
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "exception", diagnostics: `Failed to create FHIR resource: ${JSON.stringify(errorData)}` }]
+            }, null, 2)
+          }]
+        };
+      }
+    }
+
+    case "update_fhir": {
+      const resourceType = String(request.params.arguments?.resourceType);
+      const id = String(request.params.arguments?.id);
+      const payload = request.params.arguments?.payload as Record<string, any>;
+      const operation = request.params.arguments?.operation ? String(request.params.arguments.operation) : '';
+
+      if (!resourceType) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "required", diagnostics: "A required element 'resourceType' is missing." }]
+            }, null, 2)
+          }]
+        };
+      }
+
+      if (!id) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "required", diagnostics: "A required element 'id' is missing." }]
+            }, null, 2)
+          }]
+        };
+      }
+
+      try {
+        const url = operation ? `/${resourceType}/${id}/${operation}` : `/${resourceType}/${id}`;
+        const response = await fhirClient.put(url, { ...payload, id });
+        
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(response.data, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        const errorData = error.response?.data || { message: error.message };
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "exception", diagnostics: `Failed to update FHIR resource: ${JSON.stringify(errorData)}` }]
+            }, null, 2)
+          }]
+        };
+      }
+    }
+
+    case "delete_fhir": {
+      const resourceType = String(request.params.arguments?.resourceType);
+      const id = String(request.params.arguments?.id);
+      const operation = request.params.arguments?.operation ? String(request.params.arguments.operation) : '';
+
+      if (!resourceType) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "required", diagnostics: "A required element 'resourceType' is missing." }]
+            }, null, 2)
+          }]
+        };
+      }
+
+      if (!id) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "required", diagnostics: "A required element 'id' is missing." }]
+            }, null, 2)
+          }]
+        };
+      }
+
+      try {
+        const url = operation ? `/${resourceType}/${id}/${operation}` : `/${resourceType}/${id}`;
+        const response = await fhirClient.delete(url);
+        
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(response.data || {
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "information", code: "SUCCESSFUL_DELETE", diagnostics: `Successfully deleted ${resourceType}/${id}.` }]
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        const errorData = error.response?.data || { message: error.message };
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "exception", diagnostics: `Failed to delete FHIR resource: ${JSON.stringify(errorData)}` }]
+            }, null, 2)
+          }]
+        };
       }
     }
 
