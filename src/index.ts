@@ -24,6 +24,14 @@ import {
   CallToolResult
 } from "@modelcontextprotocol/sdk/types.js";
 import axios from 'axios';
+import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const DOCS_DIR = path.join(__dirname, '..', 'docs', 'modmed');
 
 interface FHIRConfig {
   baseUrl: string;
@@ -336,6 +344,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["resourceType", "id"]
         }
+      },
+      {
+        name: "search_documentation",
+        description: [
+          "Search bundled ModMed EMA FHIR API documentation for guidance on resource operations, field formats, and API behavior.",
+          "Use this tool BEFORE creating or updating FHIR resources to understand ModMed-specific requirements.",
+          "Returns relevant documentation sections matching your query, or lists available documentation topics if no matches are found."
+        ].join("\n"),
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search query to find relevant ModMed API documentation. Use resource names (e.g. 'Condition', 'Encounter', 'Appointment'), operation types ('create', 'update'), or topics ('authentication', 'value sets')."
+            }
+          },
+          required: ["query"]
+        }
       }
     ]
   };
@@ -545,6 +571,120 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             text: JSON.stringify({
               resourceType: "OperationOutcome",
               issue: [{ severity: "error", code: "exception", diagnostics: `Failed to delete FHIR resource: ${JSON.stringify(errorData)}` }]
+            }, null, 2)
+          }]
+        };
+      }
+    }
+
+    case "search_documentation": {
+      const query = String(request.params.arguments?.query || '').toLowerCase();
+
+      if (!query) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: "A 'query' parameter is required."
+            }, null, 2)
+          }]
+        };
+      }
+
+      try {
+        // Check if docs directory exists
+        if (!fs.existsSync(DOCS_DIR)) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                message: "No ModMed documentation directory found.",
+                docsPath: DOCS_DIR,
+                hint: "Download ModMed API docs into the docs/modmed/ directory."
+              }, null, 2)
+            }]
+          };
+        }
+
+        const files = fs.readdirSync(DOCS_DIR).filter(f => f.endsWith('.md'));
+
+        if (files.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                message: "No documentation files found in docs/modmed/.",
+                hint: "Add .md files to the docs/modmed/ directory."
+              }, null, 2)
+            }]
+          };
+        }
+
+        // Search through all doc files
+        const results: Array<{ file: string; relevance: number; content: string }> = [];
+
+        for (const file of files) {
+          const filePath = path.join(DOCS_DIR, file);
+          const content = fs.readFileSync(filePath, 'utf-8');
+          const lowerContent = content.toLowerCase();
+          const lowerFile = file.toLowerCase();
+
+          // Count query term matches for relevance scoring
+          const queryTerms = query.split(/\s+/).filter(Boolean);
+          let matchCount = 0;
+          for (const term of queryTerms) {
+            const regex = new RegExp(term, 'gi');
+            const matches = lowerContent.match(regex);
+            if (matches) matchCount += matches.length;
+            // Also boost if term appears in filename
+            if (lowerFile.includes(term)) matchCount += 10;
+          }
+
+          if (matchCount > 0) {
+            results.push({ file, relevance: matchCount, content });
+          }
+        }
+
+        // Sort by relevance (most matches first)
+        results.sort((a, b) => b.relevance - a.relevance);
+
+        if (results.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                message: `No documentation found matching "${query}".`,
+                availableTopics: files.map(f => f.replace(/\.md$/, ''))
+              }, null, 2)
+            }]
+          };
+        }
+
+        // Return top matches (limit to avoid overwhelming the LLM)
+        const maxResults = Math.min(results.length, 3);
+        const output = results.slice(0, maxResults).map(r => ({
+          file: r.file,
+          content: r.content
+        }));
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              query,
+              matchesFound: results.length,
+              showing: maxResults,
+              results: output
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              resourceType: "OperationOutcome",
+              issue: [{ severity: "error", code: "exception", diagnostics: `Failed to search documentation: ${error.message}` }]
             }, null, 2)
           }]
         };
