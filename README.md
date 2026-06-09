@@ -4,6 +4,8 @@ This is a TypeScript-based MCP server that connects to a FHIR server. It provide
 
 - Accessing FHIR resources via URIs
 - Providing search capabilities for FHIR resources
+- Creating, updating, and deleting FHIR resources
+- Searching bundled ModMed API documentation for guidance on resource operations and field formats
 
 ## Features
 
@@ -32,10 +34,37 @@ This is a TypeScript-based MCP server that connects to a FHIR server. It provide
 - `delete_fhir` - Delete a FHIR resource
   - Takes `resourceType`, `id`, and optional `operation`
   - Sends a DELETE request
+- `search_documentation` - Search bundled ModMed API documentation
+  - Takes `query` as a parameter
+  - Searches `.md` files in `docs/modmed/` directory with relevance scoring
+  - Returns up to 3 most relevant docs with full content
+  - Falls back to listing available topics if no matches
+
+### Error Handling
+
+All tools return structured `OperationOutcome` resources on failure, preserving ModMed's original error messages:
+
+```json
+{
+  "resourceType": "OperationOutcome",
+  "issue": [{
+    "severity": "error",
+    "code": "exception",
+    "diagnostics": "Failed to create FHIR resource: {\"message\":\"...\"}"
+  }]
+}
+```
+
+### Flexible URI Parsing
+
+The `read_fhir` tool accepts multiple URI formats:
+- `fhir://Encounter/3065019` (canonical)
+- `Encounter/3065019` (bare resourceType/id)
+- `https://.../Encounter/3065019` (full URL — extracts last two path segments)
 
 ## ModMed EMA FHIR API Notes
 
-This server was built and tested against the ModMed EMA staging API. Below are important findings to avoid common pitfalls.
+This server was built and tested against the ModMed EMA staging and production APIs. Below are important findings to avoid common pitfalls.
 
 ### Resource Operation Support
 
@@ -57,6 +86,68 @@ Not all FHIR resources support all CRUD operations on ModMed:
 | Patient | ✅ | ✅ | ✅ | ✅ | |
 | Practitioner | ✅ | ✅ | ✅ | ❌ | Referring practitioners only |
 | ServiceRequest | ✅ | ✅ | ❌ | ❌ | Orders only |
+
+### ChargeItem CREATE
+
+ChargeItems push charges into ModMed's billing system. Key details:
+
+**Required `financialTransaction` extension:**
+- `totalCost` / `unitCost` — Money objects with `value` and `currency`
+- `attendingProviderId` — Practitioner ID (not NPI)
+- `referralProviderId` — Practitioner ID
+- `locationId` — Location's PMSID (e.g., `"30"`, not the FHIR Location ID)
+- `transactionId` — Unique transaction identifier
+- `sendingFacility` — Vendor/app name configured as bridge integration (e.g., `"healthyme"`)
+- `receivingFacility` — Firm identifier (e.g., `"schweigerderm"`)
+- `financialTransactionDetail` — Nested detail with CPT `code`, `unitCost`, `quantity`, `performingProviderId`, `postingDate`, `transactionPeriod`
+
+**Code systems:**
+- Procedure codes: `CPT` (e.g., `"17000"`)
+- Diagnosis codes: `I10` for ICD-10 (e.g., `"Z02.9"`)
+
+**Response:** Returns `OperationOutcome` with `"ChargeItem successfully saved with Id: INBOUND|{id}"`. The `INBOUND|` prefix indicates the charge is in the processing queue — it may not be immediately queryable via the FHIR API until ModMed processes it.
+
+**Production vs Staging:**
+- Staging may return `"Failed to find configured business unit from npi"` — this is a ModMed configuration issue, not a payload issue
+- Production has the correct bridge integration configuration and accepts charges
+- The `sendingFacility` must match a configured vendor in ModMed Firm Admin
+
+**Example payload:**
+```json
+{
+  "resourceType": "ChargeItem",
+  "extension": [{
+    "url": "financialTransaction",
+    "extension": [
+      { "url": "totalCost", "valueMoney": { "value": "0.00", "currency": "USD" } },
+      { "url": "attendingProviderId", "valueString": "18398424" },
+      { "url": "referralProviderId", "valueString": "18398424" },
+      { "url": "locationId", "valueString": "30" },
+      { "url": "transactionId", "valueString": "test-charge-001" },
+      { "url": "sendingFacility", "valueString": "healthyme" },
+      { "url": "receivingFacility", "valueString": "schweigerderm" },
+      { "url": "financialTransactionDetail", "extension": [
+        { "url": "transactionType", "valueString": "CG" },
+        { "url": "performingProviderId", "valueString": "18398424" },
+        { "url": "code", "valueCoding": { "system": "CPT", "code": "17000", "display": "Destruction, premalignant lesion" } },
+        { "url": "unitCost", "valueMoney": { "value": "0.00", "currency": "USD" } },
+        { "url": "quantity", "valueDecimal": "1.0" },
+        { "url": "description", "valueString": "Destruction, premalignant lesion" },
+        { "url": "postingDate", "valueDateTime": "2026-06-08T17:00:00-04:00" },
+        { "url": "transactionPeriod", "valuePeriod": { "start": "2026-06-08T17:00:00-04:00", "end": "2026-06-08T17:00:00-04:00" } },
+        { "url": "diagnosisDetail", "extension": [
+          { "url": "diagnosisCode", "valueCoding": { "system": "I10", "code": "Z02.9", "display": "Encounter for administrative examinations, unspecified" } }
+        ] }
+      ] }
+    ]
+  }],
+  "status": "billable",
+  "occurrenceDateTime": "2026-06-08T17:00:00-04:00",
+  "subject": { "reference": "<FHIR_BASE_URL>/Patient/33557855" },
+  "context": { "display": "54147960" },
+  "reason": [{ "coding": [{ "system": "I10", "code": "Z02.9" }] }]
+}
+```
 
 ### Condition CREATE Requirements
 
@@ -110,10 +201,24 @@ Encounters **cannot be created via the FHIR API**. They are created internally b
 
 Attempting to POST an Encounter will fail with errors about missing "Encounter Location", "Primary Biller", and "Universal Id" — these are internal ModMed fields not exposed via FHIR.
 
+### Appointment Creation
+
+Appointments can be created via the FHIR API. Required fields:
+- `participant` — Patient, Location, and Practitioner references
+- `appointmentType` — Must use codes from the `<FHIR_BASE_URL>/ValueSet/appointment-type` ValueSet (e.g., `15452` for "Medical Established 10")
+- `start` / `end` — ISO datetime
+- `minutesDuration` — Duration in minutes
+- `status` — e.g., `"booked"`
+
+**Important:** The practitioner must have an **active calendar** in ModMed. Creating an appointment with a practitioner who doesn't have an active calendar returns: `"doesn't have an active calendar"`.
+
+**Note:** Changing appointment status to `"checked-in"` via the FHIR API does **not** trigger ModMed's internal encounter creation workflow. Encounters are created through the ModMed EMA application's internal process.
+
 ### API Response Behavior
 
-- Successful CREATE requests may return an **empty response body** with the new resource URL in the `Location` header
-- Errors are returned as FHIR `OperationOutcome` resources
+- Successful CREATE requests may return an **empty response body** with the new resource URL in the `Location` header — our tools detect this and return a `{status, resourceType, location, message}` object instead of an empty string
+- Successful ChargeItem CREATE returns an `OperationOutcome` with `INBOUND|{id}` — the charge is queued for processing
+- Errors are returned as FHIR `OperationOutcome` resources — our tools preserve ModMed's original error messages in the `diagnostics` field
 - Search results are returned as FHIR `Bundle` resources with pagination links
 
 ### ModMed API Documentation
@@ -176,11 +281,12 @@ On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
 {
   "mcpServers": {
     "fhir": {
-      "command": "/path/to/@flexpa/mcp-fhir/build/index.js"
-    },
-    "env": {
-      "FHIR_BASE_URL": "<FHIR_BASE_URL>",
-      "FHIR_ACCESS_TOKEN": "<FHIR_ACCESS_TOKEN>"
+      "command": "node",
+      "args": ["/path/to/@flexpa/mcp-fhir/build/index.js"],
+      "env": {
+        "FHIR_BASE_URL": "<FHIR_BASE_URL>",
+        "FHIR_ACCESS_TOKEN": "<FHIR_ACCESS_TOKEN>"
+      }
     }
   }
 }
@@ -191,21 +297,31 @@ For OAuth2 authentication (ModMed):
 {
   "mcpServers": {
     "fhir": {
-      "command": "/path/to/@flexpa/mcp-fhir/build/index.js"
-    },
-    "env": {
-      "FHIR_BASE_URL": "https://stage.ema-api.com/ema-dev/firm/apiportal/ema/fhir/v2/Patient",
-      "FHIR_USERNAME": "<FHIR_USERNAME>",
-      "FHIR_PASSWORD": "<FHIR_PASSWORD>",
-      "FHIR_API_KEY": "<FHIR_API_KEY>",
-      "FHIR_FIRM_URL_PREFIX": "<FHIR_FIRM_URL_PREFIX>",
-      "FHIR_USE_OAUTH2": "<FHIR_USE_OAUTH2>"
+      "command": "npx",
+      "args": ["tsx", "/path/to/@flexpa/mcp-fhir/src/index.ts"],
+      "env": {
+        "FHIR_BASE_URL": "https://mmapi.ema-api.com/ema-prod/firm/schweigerderm/ema/fhir/v2/Patient",
+        "FHIR_USERNAME": "<FHIR_USERNAME>",
+        "FHIR_PASSWORD": "<FHIR_PASSWORD>",
+        "FHIR_API_KEY": "<FHIR_API_KEY>",
+        "FHIR_FIRM_URL_PREFIX": "<FHIR_FIRM_URL_PREFIX>",
+        "FHIR_USE_OAUTH2": "true"
+      }
     }
   }
 }
 ```
 
 **Note:** When `FHIR_USE_OAUTH2` is set to `"true"`, the `FHIR_ACCESS_TOKEN` is not required.
+
+### ModMed API Documentation
+
+The `docs/modmed/` directory contains bundled ModMed API documentation that the `search_documentation` tool searches against. Topics include:
+
+- Authentication & OAuth2 grant flow
+- Resource-specific guides: Condition, ChargeItem, Patient, Encounter, Appointment, Coverage, Organization, DocumentReference, Composition
+- Operational guides: Pagination, Rate limiting, Response codes, Header flags
+- Endpoint examples: Get patient, Get encounters, Get conditions, Get bearer token
 
 ### Debugging
 

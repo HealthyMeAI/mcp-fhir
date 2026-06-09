@@ -66,11 +66,11 @@ The `extension` array must contain a single `financialTransaction` extension wit
 | Extension URL | Type | Required | Description |
 |---------------|------|----------|-------------|
 | `totalCost` | Money | Yes | Total cost of the charge (value + currency) |
-| `attendingProviderId` | string | Yes | Practitioner ID of the attending provider |
+| `attendingProviderId` | string | Yes | Practitioner ID of the attending provider (must be a correctly configured practitioner — not all practitioners are set up for charge creation) |
 | `referralProviderId` | string | Yes | Practitioner ID of the referral provider |
-| `locationId` | string | Yes | Location/facility ID |
+| `locationId` | string | Yes | **Location PMSID** (not the FHIR Location ID). Find it in the Location resource's `identifier` where `system` = `"PMSID"` (e.g. `"103336FAC000000034"`) |
 | `transactionId` | string | Yes | Unique transaction identifier |
-| `sendingFacility` | string | Yes | Name of the sending facility/vendor (e.g. `"healthyme"`) |
+| `sendingFacility` | string | Yes | Name of the configured bridge integration vendor. **Must be `"healthyme"`** — other values like `"modmed"`, `"apiportal"`, `"mcp-fhir"` are not configured and will return `"Failed to find a bridge integration"` |
 | `receivingFacility` | string | Yes | Firm identifier (e.g. `"schweigerderm"`) |
 | `financialTransactionDetail` | Extension | Yes | Nested detail extension (see below) |
 
@@ -248,16 +248,45 @@ The `supportingInformation` array references Coverage resources. Include referen
 
 ## Notes
 
-- The `sendingFacility` identifies your vendor/application (e.g. `"healthyme"`)
-- The `receivingFacility` is the ModMed firm identifier (e.g. `"schweigerderm"`)
+### sendingFacility Configuration
+Only `"healthyme"` is configured as a bridge integration for inbound charges. Other values (`"modmed"`, `"apiportal"`, `"mcp-fhir"`) will fail with `"Failed to find a bridge integration"`. This applies to both staging and production.
+
+### locationId — Must Use PMSID
+The `locationId` field requires the Location's **PMSID**, not the FHIR Location resource ID. To find the correct value:
+1. Read the Location resource via the FHIR API
+2. Look in the `identifier` array for the entry where `system` = `"PMSID"`
+3. Use that value (e.g., `"103336FAC000000034"` for Location 1068, `"30"` for Location 1471)
+
+### Practitioner Configuration
+The practitioner referenced in `attendingProviderId` must be correctly configured in ModMed for charge creation. Using an unconfigured practitioner may return `"Failed to find configured business unit from npi provided in payload"`.
+
+### Autobill
+When **Auto-create bill** (Autobill) is enabled in Firm Admin, charges pushed via API automatically generate bills in the New Bills tab. Autobill is now enabled in the Schweiger Derm production environment.
+
+### Response Format
+Successful CREATE returns an `OperationOutcome` with the charge ID in `INBOUND|{id}` format:
+```json
+{
+  "resourceType": "OperationOutcome",
+  "issue": [{
+    "severity": "information",
+    "code": "informational",
+    "diagnostics": "ChargeItem successfully saved with Id: INBOUND|1001362"
+  }]
+}
+```
+The `INBOUND|` prefix indicates the charge is in the processing queue. It may not be immediately queryable via the FHIR API (`GET /ChargeItem/INBOUND|{id}` returns 400 due to the pipe character).
+
+### General
 - `context.display` contains the encounter ID as a string
 - `subject.reference` is a full URL to the patient resource
-- `supportingInformation` references Coverage resources by full URL
-- When **Auto-create bill** is enabled in Firm Admin, charges pushed via API automatically generate bills in the New Bills tab
-- The sandbox environment may need ChargeItem_CREATE configuration enabled separately — contact ModMed support if CREATE fails in sandbox
+- `supportingInformation` references Coverage resources by full URL (optional if patient has no coverage)
 - `transactionId` should be a unique identifier for each charge transaction
+- Staging environments may have additional configuration issues (NPI→business unit mapping not set up) that are resolved in production
 
 ---
 
 *Source: ModMed Synapsys team correspondence (Shakawat Sobuj), May 2026*
+*Production testing confirmed June 2026 — patient Bob Admin (33557855), encounter 54147960, ChargeItem INBOUND|1001362*
+*Bridge integration and PMSID guidance confirmed by ModMed support, June 2026*
 *Reference: https://portal.api.modmed.com/reference/chargeitem*
