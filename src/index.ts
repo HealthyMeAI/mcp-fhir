@@ -238,13 +238,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "read_fhir",
-        description: "Read an individual FHIR resource",
+        description: "Read an individual FHIR resource by its URI. The URI must use the format: fhir://{resourceType}/{id} (e.g. fhir://Encounter/3065019, fhir://Patient/99081, fhir://Condition/848539)",
         inputSchema: {
           type: "object",
           properties: {
             uri: {
               type: "string",
-              description: "URI of the FHIR resource to read"
+              description: "URI of the FHIR resource to read. Must use format: fhir://{resourceType}/{id} (e.g. fhir://Encounter/3065019)"
             }
           },
           required: ["uri"]
@@ -392,9 +392,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
     case "read_fhir": {
       const uri = String(request.params.arguments?.uri);
-      const url = new URL(uri);
-      const resourceType = url.hostname;
-      const id = url.pathname.replace(/^\//, '');
+      let resourceType: string;
+      let id: string;
+
+      if (uri.startsWith("fhir://")) {
+        const url = new URL(uri);
+        resourceType = url.hostname;
+        id = url.pathname.replace(/^\//, '');
+      } else if (uri.match(/^https?:\/\//)) {
+        const url = new URL(uri);
+        const parts = url.pathname.split("/").filter(Boolean);
+        id = parts.pop() || "";
+        resourceType = parts.pop() || "";
+      } else {
+        const parts = uri.replace(/^\//, "").split("/");
+        resourceType = parts[0];
+        id = parts.slice(1).join("/");
+      }
 
       try {
         const response = await fhirClient.get(`/${resourceType}/${id}`);
